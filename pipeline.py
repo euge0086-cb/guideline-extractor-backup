@@ -30,17 +30,26 @@ from openpyxl.utils import get_column_letter
 
 def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]:
     """
-    Extrae TODAS las referencias de una guía clínica en PDF.
+    Extrae TODAS las referencias de un PDF (artículo o guía clínica),
+    de forma UNIVERSAL e independiente del layout editorial.
 
-    Maneja dos formatos:
-      (a) Artículos cortos: una única sección "References" al final.
-      (b) Guías largas (ACC/AHA, ESC): "References" aparece MÚLTIPLES
-          veces, una por cada sección temática del documento (ej. la
-          guía 2014 AHA/ACC NSTE-ACS tiene 14 bloques distintos).
-          Hay que recoger TODOS estos bloques, no solo el primero.
+    ESTRATEGIA EN DOS FASES:
 
-    Filtra agresivamente contenido que no es una referencia real:
-    tablas de farmacología, headers/footers de página repetidos.
+    FASE 1 — Punto de inicio universal: se localiza la ÚLTIMA aparición
+    del header "References" en todo el documento. La sección de
+    referencias real de cualquier artículo o guía es siempre la última
+    (evita falsos positivos de menciones previas en el índice o cuerpo
+    del texto). A partir de esa página se considera que todo lo que
+    sigue son referencias.
+
+    FASE 2 — Reconstrucción robusta dentro de ese bloque: en vez de
+    asumir la geometría de columnas (frágil y específica de cada
+    editorial), se localizan los marcadores numéricos de inicio de
+    referencia ("1.", "01.", "827.") que aparecen como PRIMERA palabra
+    de su línea. Se valida la secuencia con el algoritmo de subsecuencia
+    creciente más larga (LIS), y las posiciones X de esos marcadores se
+    clusterizan dinámicamente para inferir cuántas columnas tiene el
+    documento — sin asumir ningún ancho o número fijo.
     """
     log = []
 
@@ -51,143 +60,267 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
 
     HEADER_PATTERNS = [
         r'^references?\s*:?\s*\d{0,4}\s*$',
+        r'^\d{1,3}\s+references?\s*$',          # "17 References"
         r'^bibliograf[ií]a\s*:?\s*\d{0,4}\s*$',
         r'^referenci[ae]s\s*:?\s*\d{0,4}\s*$',
         r'^literature\s+cited\s*$',
         r'^works\s+cited\s*$',
     ]
-    # Líneas que indican que el bloque de referencias actual ha TERMINADO
-    # y empieza contenido normal de la siguiente sección
     SECTION_END_PATTERNS = [
-        r'^\d{1,2}\.\d{1,2}\.?\d{0,2}\.?\s+[A-Z][a-z]{2,}',  # "4.2.1 Initial Evaluation"
         r'^table\s+[a-z0-9]+\b', r'^figure\s+\d+',
-        r'^central\s+illustration\b', r'^appendix\b',
-        r'^class\s+(i{1,3}|iv)\b.{0,30}(recommendation|level)',
+        r'^appendix\b', r'^central\s+illustration\b',
     ]
-    # Ruido típico: headers/footers de página repetidos en cada hoja
     NOISE_PATTERNS = [
         r'^(jacc|circulation|eur\s*heart\s*j?|j\s*am\s*coll\s*cardiol)\b.{0,50}\d{4}',
         r'^\d{4}\s*(aha|acc|esc)\b.{0,80}guideline',
-        r'^downloaded\s+from', r'^e\d{2,4}\s+\w+', r'page\s+\d+\s+of\s+\d+',
+        r'^downloaded\s+from', r'page\s+\d+\s+of\s+\d+',
+        r'^esc\s+guidelines\s*\d{0,5}$',          # pie de página típico ESC
+        r'^\d{4}\s*esc\s+guidelines\s*$',
     ]
 
     def is_header(line: str) -> bool:
         c = line.strip()
         return any(re.match(p, c, re.IGNORECASE) for p in HEADER_PATTERNS)
 
-    def is_section_end(line: str) -> bool:
-        c = line.strip()
-        return any(re.match(p, c, re.IGNORECASE) for p in SECTION_END_PATTERNS)
+    def is_noise(text: str) -> bool:
+        return any(re.search(p, text, re.IGNORECASE) for p in NOISE_PATTERNS)
 
-    def is_noise(line: str) -> bool:
-        c = line.strip()
-        return any(re.search(p, c, re.IGNORECASE) for p in NOISE_PATTERNS)
+    # Acepta "1." y también "01." (ceros a la izquierda, frecuente en ESC)
+    MARKER_RE = re.compile(r'^0*(\d{1,4})[\.\)](.*)$')
 
-    def is_ref_start(line: str) -> bool:
-        return bool(re.match(r'^\d{1,4}[\.\)]\s+\S', line.strip()))
+    def looks_like_reference_start(rest_text: str, next_word_text: str = "") -> bool:
+        combined = (rest_text + " " + next_word_text).strip()
+        if not combined:
+            return False
+        if not combined[0].isupper():
+            return False
+        first_tok = combined.split()[0] if combined.split() else ""
+        if re.match(r'^\d{4}\.?$', first_tok):
+            return False
+        if re.match(r'^(https?|doi|www)', combined, re.IGNORECASE):
+            return False
+        return True
 
-    # ── Extraer todas las líneas del documento, columna por columna ──────
-    flat_lines = []
+    # ── FASE 1: localizar la ÚLTIMA aparición de "References" ────────────
+    all_words_by_page = []
+    header_pages = []
+
     with pdfplumber.open(pdf_path) as pdf:
         n_pages = len(pdf.pages)
         dbg(f"[INFO] PDF con {n_pages} páginas")
 
-        for page in pdf.pages:
-            page_width = page.width
-            left_col = page.crop((0, 0, page_width / 2, page.height))
-            right_col = page.crop((page_width / 2, 0, page_width, page.height))
+        for page_idx, page in enumerate(pdf.pages):
+            try:
+                words = page.extract_words()
+            except Exception:
+                words = []
+            all_words_by_page.append(words)
 
-            for col in [left_col, right_col]:
-                try:
-                    words = col.extract_words()
-                except Exception:
-                    words = []
-                if not words:
-                    continue
-                line_map = {}
-                for w in words:
-                    y_key = round(w["top"])
-                    line_map.setdefault(y_key, []).append(w["text"])
-                for y_key in sorted(line_map.keys()):
-                    line = " ".join(line_map[y_key]).strip()
-                    if line:
-                        flat_lines.append(line)
+            line_map = {}
+            for w in words:
+                y_key = round(w["top"])
+                line_map.setdefault(y_key, []).append(w["text"])
+            for toks in line_map.values():
+                line = " ".join(toks).strip()
+                if is_header(line):
+                    header_pages.append(page_idx)
+                    break
 
-    # ── Encontrar TODOS los headers "References" del documento ───────────
-    header_indices = [i for i, l in enumerate(flat_lines) if is_header(l)]
-    dbg(f"[INFO] Headers 'References' encontrados en el documento: {len(header_indices)}")
+    dbg(f"[INFO] Apariciones de header 'References' en el documento: "
+        f"{len(header_pages)} → páginas {[p+1 for p in header_pages]}")
 
-    all_ref_lines = []
-    for h_idx in header_indices:
-        block = []
-        for j in range(h_idx + 1, min(h_idx + 400, len(flat_lines))):
-            line = flat_lines[j]
-            if is_header(line):
-                break  # empieza el siguiente bloque
-            if is_section_end(line) and len(block) > 3:
-                break  # este bloque de referencias ha terminado
-            if is_noise(line):
+    if header_pages:
+        last_header_page = header_pages[-1]
+        dbg(f"[INFO] Usando la ÚLTIMA aparición (página {last_header_page + 1}) "
+            f"como inicio de la sección de referencias")
+        candidate_pages = set(range(last_header_page, n_pages))
+    else:
+        dbg("[WARN] No se encontró ningún header 'References'. "
+            "Se buscarán marcadores numerados en todo el documento.")
+        candidate_pages = set(range(n_pages))
+
+    # ── FASE 2: localizar marcadores de inicio de referencia ─────────────
+    # IMPORTANTE: NO agrupamos primero por línea-Y combinando toda la
+    # página, porque dos columnas distintas pueden compartir la misma
+    # coordenada Y (su texto está en la misma fila visual) y eso fusiona
+    # erróneamente ambas columnas en una sola "línea", perdiendo el
+    # marcador de la columna derecha. En su lugar, evaluamos cada
+    # palabra de forma independiente como posible marcador, y para
+    # validarla buscamos la palabra que le sigue espacialmente DENTRO
+    # DE SU PROPIA COLUMNA (incremento de Y, X similar) — no la
+    # siguiente palabra en X dentro de la misma fila combinada.
+    all_markers = []
+    for page_idx in sorted(candidate_pages):
+        page_words = all_words_by_page[page_idx]
+
+        for w in page_words:
+            m = MARKER_RE.match(w["text"])
+            if not m:
                 continue
-            block.append(line)
-        all_ref_lines.extend(block)
-        dbg(f"[INFO]   Bloque #{h_idx}: {len(block)} líneas recogidas")
+            num = int(m.group(1))
+            rest = m.group(2)
 
-    # ── Fallback: si no hay headers explícitos, buscar bloque numerado ───
-    if not all_ref_lines:
-        dbg("[WARN] Sin headers 'References' explícitos. Probando fallback "
-            "de detección por numeración consecutiva.")
-        ref_start_indices = [i for i, l in enumerate(flat_lines) if is_ref_start(l)]
-        if len(ref_start_indices) >= 5:
-            numbers = []
-            for i in ref_start_indices:
-                m = re.match(r'^(\d{1,4})', flat_lines[i].strip())
-                if m:
-                    numbers.append((i, int(m.group(1))))
-            best_start, best_len, run_start = None, 0, 0
-            for k in range(1, len(numbers)):
-                if numbers[k][1] <= numbers[k-1][1] or numbers[k][1] - numbers[k-1][1] > 3:
-                    run_len = k - run_start
-                    if run_len > best_len:
-                        best_len, best_start = run_len, run_start
-                    run_start = k
-            run_len = len(numbers) - run_start
-            if run_len > best_len:
-                best_len, best_start = run_len, run_start
-            if best_start is not None and best_len >= 5:
-                start_idx = numbers[best_start][0]
-                all_ref_lines = flat_lines[start_idx:]
-                dbg(f"[INFO] Fallback: bloque numerado de {best_len} referencias encontrado")
+            # Si el propio token ya trae texto pegado (p.ej. "5.Bonow"),
+            # usamos eso. Si no (p.ej. "5." y "Bonow" son tokens
+            # separados), buscamos la palabra más cercana que SIGA al
+            # marcador en su misma columna: misma fila (top similar,
+            # x0 inmediatamente mayor) o, si no hay nada en esa fila,
+            # la siguiente fila por debajo con x0 similar al marcador.
+            next_word_text = ""
+            if not rest.strip():
+                same_row_candidates = [
+                    ww for ww in page_words
+                    if abs(ww["top"] - w["top"]) < 1.5 and ww["x0"] > w["x1"] and ww["x0"] - w["x1"] < 15
+                ]
+                if same_row_candidates:
+                    same_row_candidates.sort(key=lambda ww: ww["x0"])
+                    next_word_text = same_row_candidates[0]["text"]
+                else:
+                    below_candidates = [
+                        ww for ww in page_words
+                        if ww["top"] > w["top"] + 1.5
+                        and abs(ww["x0"] - w["x0"]) < 30
+                    ]
+                    if below_candidates:
+                        below_candidates.sort(key=lambda ww: ww["top"])
+                        next_word_text = below_candidates[0]["text"]
 
-    if not all_ref_lines:
-        dbg("[ERROR] No se encontraron referencias. El PDF puede ser escaneado, "
-            "protegido, o no tener secciones 'References' identificables.")
+            if not looks_like_reference_start(rest, next_word_text):
+                continue
+
+            all_markers.append({
+                "num": num, "page": page_idx,
+                "x0": w["x0"], "x1": w["x1"], "top": w["top"],
+                "rest": rest,
+            })
+
+    dbg(f"[INFO] Marcadores numéricos candidatos: {len(all_markers)}")
+
+    if not all_markers:
+        dbg("[ERROR] No se encontraron marcadores de referencia numerados.")
         if not debug:
             for l in log:
                 print(l)
         return []
 
-    # ── Reconstruir referencias completas a partir de las líneas ─────────
-    full_refs = []
-    current = ""
-    for line in all_ref_lines:
-        line = line.strip()
-        if not line or is_noise(line):
-            continue
-        if is_ref_start(line):
-            if current:
-                full_refs.append(re.sub(r'\s+', ' ', current).strip())
-            current = line
-        elif current:
-            current += " " + line
-    if current:
-        full_refs.append(re.sub(r'\s+', ' ', current).strip())
+    # ── Validar la secuencia mediante LIS (Longest Increasing Subsequence)
+    all_markers.sort(key=lambda m: m["num"])
+    nums = [m["num"] for m in all_markers]
+    n = len(nums)
 
-    # ── Filtrar referencias degeneradas (filas de tabla, ruido) ──────────
+    dp = [1] * n
+    parent = [-1] * n
+    for i in range(n):
+        for j in range(i):
+            if nums[j] < nums[i] and dp[j] + 1 > dp[i]:
+                dp[i] = dp[j] + 1
+                parent[i] = j
+    best_end = max(range(n), key=lambda i: dp[i])
+    lis_indices = []
+    cur = best_end
+    while cur != -1:
+        lis_indices.append(cur)
+        cur = parent[cur]
+    lis_indices.reverse()
+
+    valid_markers = [all_markers[i] for i in lis_indices]
+    valid_markers.sort(key=lambda m: (m["page"], m["top"], m["x0"]))
+
+    dbg(f"[INFO] Marcadores validados (secuencia creciente más larga): "
+        f"{len(valid_markers)} de {len(all_markers)} candidatos "
+        f"(#{valid_markers[0]['num'] if valid_markers else '-'} a "
+        f"#{valid_markers[-1]['num'] if valid_markers else '-'})")
+
+    if len(valid_markers) < 3:
+        dbg("[ERROR] Menos de 3 marcadores válidos en secuencia. Abortando.")
+        if not debug:
+            for l in log:
+                print(l)
+        return []
+
+    # ── Clusterizar posiciones X de los marcadores para inferir columnas
+    xs = sorted(set(round(m["x0"]) for m in valid_markers))
+    column_clusters = []
+    for x in xs:
+        placed = False
+        for cluster in column_clusters:
+            if abs(x - cluster[-1]) < 20:
+                cluster.append(x)
+                placed = True
+                break
+        if not placed:
+            column_clusters.append([x])
+    column_centers = [sum(c) / len(c) for c in column_clusters]
+    dbg(f"[INFO] Columnas detectadas a partir de marcadores: {len(column_centers)} "
+        f"en x≈{[round(c) for c in column_centers]}")
+
+    def nearest_column(x0):
+        return min(column_centers, key=lambda c: abs(c - x0))
+
+    # ── Reconstruir el texto de cada referencia ───────────────────────────
+    # Para delimitar el final de cada referencia usamos el SIGUIENTE
+    # marcador que esté en su MISMA columna (no necesariamente el
+    # siguiente en la secuencia global), ya que dos columnas avanzan en
+    # paralelo y el marcador inmediatamente siguiente en número puede
+    # estar en la columna de al lado, sin relación de continuidad visual.
+    full_refs = []
+    for i, mk in enumerate(valid_markers):
+        mk_column = nearest_column(mk["x0"])
+
+        # Buscar el siguiente marcador (en orden de número) que comparta
+        # la misma columna que el actual
+        next_mk = None
+        for j in range(i + 1, len(valid_markers)):
+            if nearest_column(valid_markers[j]["x0"]) == mk_column:
+                next_mk = valid_markers[j]
+                break
+
+        collected_words = [mk["rest"]] if mk["rest"].strip() else []
+
+        start_page = mk["page"]
+        end_page = next_mk["page"] if next_mk else start_page
+
+        for page_idx in range(start_page, end_page + 1):
+            page_words = all_words_by_page[page_idx]
+            for w in page_words:
+                if page_idx == mk["page"] and abs(w["top"] - mk["top"]) < 0.5 and w["x0"] == mk["x0"]:
+                    continue
+
+                same_page_as_marker = (page_idx == mk["page"])
+                after_start = True
+                if same_page_as_marker:
+                    after_start = w["top"] >= mk["top"] - 0.5
+
+                before_end = True
+                if next_mk and page_idx == next_mk["page"]:
+                    if page_idx == mk["page"]:
+                        before_end = (w["top"] < next_mk["top"] - 0.5) or \
+                                     (abs(w["top"] - next_mk["top"]) < 0.5 and w["x0"] < next_mk["x0"])
+                    else:
+                        before_end = w["top"] < next_mk["top"] - 0.5
+
+                in_column = nearest_column(w["x0"]) == mk_column
+
+                if after_start and before_end and in_column:
+                    collected_words.append(w["text"])
+
+            if next_mk and page_idx == next_mk["page"]:
+                break
+
+        ref_text = f"{mk['num']}. " + " ".join(collected_words)
+        ref_text = re.sub(r'\s+', ' ', ref_text).strip()
+
+        if is_noise(ref_text[:80]):
+            continue
+
+        full_refs.append(ref_text)
+
+    # ── Filtrar referencias degeneradas ───────────────────────────────────
     def looks_like_table_row(text: str) -> bool:
         digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
-        return digit_ratio > 0.35 or text.count('|') > 2
+        return digit_ratio > 0.45 or text.count('|') > 2
 
-    clean_refs = [r for r in full_refs if len(r) >= 25 and not looks_like_table_row(r)]
+    clean_refs = [r for r in full_refs if len(r) >= 20 and not looks_like_table_row(r)]
 
     dbg(f"[INFO] Referencias extraídas (total final, tras limpieza): {len(clean_refs)}")
     if not debug:
