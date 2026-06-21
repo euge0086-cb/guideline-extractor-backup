@@ -30,15 +30,17 @@ from openpyxl.utils import get_column_letter
 
 def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]:
     """
-    Extrae el bloque de referencias de un PDF de guía clínica.
-    Soporta PDFs de una y dos columnas, mayúsculas/minúsculas,
-    y formatos con numeración de página intercalada.
+    Extrae TODAS las referencias de una guía clínica en PDF.
 
-    Estrategia de 3 niveles:
-      A. Detección por columnas con header de sección "References"
-      B. Fallback: texto completo lineal con header de sección
-      C. Fallback final: buscar el ÚLTIMO bloque de líneas numeradas
-         consecutivas del documento (las guías casi siempre acaban así)
+    Maneja dos formatos:
+      (a) Artículos cortos: una única sección "References" al final.
+      (b) Guías largas (ACC/AHA, ESC): "References" aparece MÚLTIPLES
+          veces, una por cada sección temática del documento (ej. la
+          guía 2014 AHA/ACC NSTE-ACS tiene 14 bloques distintos).
+          Hay que recoger TODOS estos bloques, no solo el primero.
+
+    Filtra agresivamente contenido que no es una referencia real:
+    tablas de farmacología, headers/footers de página repetidos.
     """
     log = []
 
@@ -47,39 +49,51 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
         if debug:
             print(msg)
 
-    # Patrones de header de sección "References" (tolerante a mayúsculas,
-    # números de página pegados, dos puntos, etc.)
     HEADER_PATTERNS = [
-        r'^references?\s*:?\s*\d*\s*$',
-        r'^bibliograf[ií]a\s*:?\s*\d*\s*$',
-        r'^referenci[ae]s\s*:?\s*\d*\s*$',
+        r'^references?\s*:?\s*\d{0,4}\s*$',
+        r'^bibliograf[ií]a\s*:?\s*\d{0,4}\s*$',
+        r'^referenci[ae]s\s*:?\s*\d{0,4}\s*$',
         r'^literature\s+cited\s*$',
         r'^works\s+cited\s*$',
     ]
+    # Líneas que indican que el bloque de referencias actual ha TERMINADO
+    # y empieza contenido normal de la siguiente sección
+    SECTION_END_PATTERNS = [
+        r'^\d{1,2}\.\d{1,2}\.?\d{0,2}\.?\s+[A-Z][a-z]{2,}',  # "4.2.1 Initial Evaluation"
+        r'^table\s+[a-z0-9]+\b', r'^figure\s+\d+',
+        r'^central\s+illustration\b', r'^appendix\b',
+        r'^class\s+(i{1,3}|iv)\b.{0,30}(recommendation|level)',
+    ]
+    # Ruido típico: headers/footers de página repetidos en cada hoja
+    NOISE_PATTERNS = [
+        r'^(jacc|circulation|eur\s*heart\s*j?|j\s*am\s*coll\s*cardiol)\b.{0,50}\d{4}',
+        r'^\d{4}\s*(aha|acc|esc)\b.{0,80}guideline',
+        r'^downloaded\s+from', r'^e\d{2,4}\s+\w+', r'page\s+\d+\s+of\s+\d+',
+    ]
 
     def is_header(line: str) -> bool:
-        line_clean = line.strip()
-        for pat in HEADER_PATTERNS:
-            if re.match(pat, line_clean, re.IGNORECASE):
-                return True
-        return False
+        c = line.strip()
+        return any(re.match(p, c, re.IGNORECASE) for p in HEADER_PATTERNS)
+
+    def is_section_end(line: str) -> bool:
+        c = line.strip()
+        return any(re.match(p, c, re.IGNORECASE) for p in SECTION_END_PATTERNS)
+
+    def is_noise(line: str) -> bool:
+        c = line.strip()
+        return any(re.search(p, c, re.IGNORECASE) for p in NOISE_PATTERNS)
 
     def is_ref_start(line: str) -> bool:
-        """Detecta inicio de referencia numerada: '1.', '12.', '1)', etc."""
         return bool(re.match(r'^\d{1,4}[\.\)]\s+\S', line.strip()))
 
-    # ── NIVEL A: extracción por columnas con detección de header ──────────
-    all_lines_by_page = []
-    header_found_at = None
-
+    # ── Extraer todas las líneas del documento, columna por columna ──────
+    flat_lines = []
     with pdfplumber.open(pdf_path) as pdf:
         n_pages = len(pdf.pages)
         dbg(f"[INFO] PDF con {n_pages} páginas")
 
-        for page_idx, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             page_width = page.width
-            page_lines = []
-
             left_col = page.crop((0, 0, page_width / 2, page.height))
             right_col = page.crop((page_width / 2, 0, page_width, page.height))
 
@@ -97,137 +111,90 @@ def extract_references_from_pdf(pdf_path: str, debug: bool = False) -> list[str]
                 for y_key in sorted(line_map.keys()):
                     line = " ".join(line_map[y_key]).strip()
                     if line:
-                        page_lines.append(line)
+                        flat_lines.append(line)
 
-            all_lines_by_page.append(page_lines)
+    # ── Encontrar TODOS los headers "References" del documento ───────────
+    header_indices = [i for i, l in enumerate(flat_lines) if is_header(l)]
+    dbg(f"[INFO] Headers 'References' encontrados en el documento: {len(header_indices)}")
 
-            if header_found_at is None:
-                for line in page_lines:
-                    if is_header(line):
-                        header_found_at = page_idx
-                        dbg(f"[INFO] Header 'References' encontrado en página {page_idx + 1}: '{line}'")
-                        break
+    all_ref_lines = []
+    for h_idx in header_indices:
+        block = []
+        for j in range(h_idx + 1, min(h_idx + 400, len(flat_lines))):
+            line = flat_lines[j]
+            if is_header(line):
+                break  # empieza el siguiente bloque
+            if is_section_end(line) and len(block) > 3:
+                break  # este bloque de referencias ha terminado
+            if is_noise(line):
+                continue
+            block.append(line)
+        all_ref_lines.extend(block)
+        dbg(f"[INFO]   Bloque #{h_idx}: {len(block)} líneas recogidas")
 
-    if header_found_at is not None:
-        # Reunir todas las líneas desde el header en adelante
-        all_lines = []
-        collecting = False
-        for page_idx, page_lines in enumerate(all_lines_by_page):
-            for line in page_lines:
-                if not collecting:
-                    if is_header(line):
-                        collecting = True
-                    continue
-                all_lines.append(line)
-        dbg(f"[INFO] Nivel A (columnas): {len(all_lines)} líneas recogidas tras el header")
-    else:
-        all_lines = []
-        dbg("[WARN] Nivel A falló: no se encontró header 'References' por columnas")
-
-    # ── NIVEL B: fallback texto lineal simple (sin separar columnas) ──────
-    if not all_lines:
-        dbg("[INFO] Probando Nivel B: extracción de texto simple")
-        full_text = ""
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    full_text += t + "\n"
-
-        header_pos = None
-        for pat in HEADER_PATTERNS:
-            m = re.search(pat, full_text, re.IGNORECASE | re.MULTILINE)
-            if m:
-                header_pos = m.end()
-                dbg(f"[INFO] Nivel B: header encontrado con patrón '{pat}'")
-                break
-
-        if header_pos:
-            all_lines = full_text[header_pos:].split("\n")
-            dbg(f"[INFO] Nivel B: {len(all_lines)} líneas tras el header")
-
-    # ── NIVEL C: último recurso — buscar el último bloque numerado denso ──
-    if not all_lines:
-        dbg("[INFO] Probando Nivel C: detección del último bloque numerado")
-        # Concatenar todas las líneas de todas las páginas en orden
-        flat_lines = []
-        for page_lines in all_lines_by_page:
-            flat_lines.extend(page_lines)
-
-        # Buscar posiciones de líneas que parecen inicio de referencia
+    # ── Fallback: si no hay headers explícitos, buscar bloque numerado ───
+    if not all_ref_lines:
+        dbg("[WARN] Sin headers 'References' explícitos. Probando fallback "
+            "de detección por numeración consecutiva.")
         ref_start_indices = [i for i, l in enumerate(flat_lines) if is_ref_start(l)]
-
         if len(ref_start_indices) >= 5:
-            # Verificar que las referencias siguen una numeración creciente
-            # consecutiva (tolerando algún salto pequeño por ruido de OCR)
             numbers = []
             for i in ref_start_indices:
                 m = re.match(r'^(\d{1,4})', flat_lines[i].strip())
                 if m:
                     numbers.append((i, int(m.group(1))))
-
-            # Encontrar el tramo más largo de numeración creciente
-            best_start = None
-            best_len = 0
-            run_start = 0
+            best_start, best_len, run_start = None, 0, 0
             for k in range(1, len(numbers)):
                 if numbers[k][1] <= numbers[k-1][1] or numbers[k][1] - numbers[k-1][1] > 3:
                     run_len = k - run_start
                     if run_len > best_len:
-                        best_len = run_len
-                        best_start = run_start
+                        best_len, best_start = run_len, run_start
                     run_start = k
             run_len = len(numbers) - run_start
             if run_len > best_len:
-                best_len = run_len
-                best_start = run_start
-
+                best_len, best_start = run_len, run_start
             if best_start is not None and best_len >= 5:
-                start_line_idx = numbers[best_start][0]
-                all_lines = flat_lines[start_line_idx:]
-                dbg(f"[INFO] Nivel C: bloque numerado encontrado desde línea {start_line_idx}, "
-                    f"{best_len} referencias detectadas en la secuencia")
+                start_idx = numbers[best_start][0]
+                all_ref_lines = flat_lines[start_idx:]
+                dbg(f"[INFO] Fallback: bloque numerado de {best_len} referencias encontrado")
 
-    if not all_lines:
-        dbg("[ERROR] Los 3 niveles de extracción fallaron. "
-            "El PDF puede tener un formato no soportado (escaneado, protegido, o sin referencias numeradas).")
+    if not all_ref_lines:
+        dbg("[ERROR] No se encontraron referencias. El PDF puede ser escaneado, "
+            "protegido, o no tener secciones 'References' identificables.")
         if not debug:
             for l in log:
                 print(l)
         return []
 
-    # ── Unir líneas en referencias completas ───────────────────────────────
+    # ── Reconstruir referencias completas a partir de las líneas ─────────
     full_refs = []
     current = ""
-    page_footer_pattern = re.compile(
-        r'^(Representativeness|European|Eur\s+Heart|Circulation|JAMA|J\s+Am\s+Coll|'
-        r'Downloaded\s+from|page\s+\d+|^\d{1,4}$)', re.IGNORECASE
-    )
-
-    for line in all_lines:
+    for line in all_ref_lines:
         line = line.strip()
-        if not line:
+        if not line or is_noise(line):
             continue
         if is_ref_start(line):
             if current:
                 full_refs.append(re.sub(r'\s+', ' ', current).strip())
             current = line
         elif current:
-            if page_footer_pattern.match(line):
-                continue
             current += " " + line
-
     if current:
         full_refs.append(re.sub(r'\s+', ' ', current).strip())
 
-    full_refs = [r for r in full_refs if len(r) > 25]
+    # ── Filtrar referencias degeneradas (filas de tabla, ruido) ──────────
+    def looks_like_table_row(text: str) -> bool:
+        digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
+        return digit_ratio > 0.35 or text.count('|') > 2
 
-    dbg(f"[INFO] Referencias extraídas (total final): {len(full_refs)}")
+    clean_refs = [r for r in full_refs if len(r) >= 25 and not looks_like_table_row(r)]
+
+    dbg(f"[INFO] Referencias extraídas (total final, tras limpieza): {len(clean_refs)}")
     if not debug:
         for l in log:
             print(l)
 
-    return full_refs
+    return clean_refs
 
 
 # ─────────────────────────────────────────────
